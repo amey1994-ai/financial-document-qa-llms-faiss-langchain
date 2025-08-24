@@ -1,0 +1,466 @@
+import os
+from pathlib import Path
+from typing import Tuple, List
+from tqdm import tqdm
+
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# ================= Settings =================
+MAIN_FOLDER =  r"C:\Users\AmeyMestry\Downloads\NSE_Reports\NSE_Reports_30-07-25\Sheet3\pt1\Shemaroo_Entertainment_Limited"
+
+OUTPUT_BASE = "C:\Users\AMEY MESTRY\Downloads\pt1\pt1\vector_shemaroo_financial_faiss_index_cognaize_financial_embedding"  
+os.makedirs(OUTPUT_BASE, exist_ok=True)
+
+# Embeddings (downloaded from Hugging Face)
+# This ensures the model exists locally
+EMBEDDING_MODEL = HuggingFaceEmbeddings(
+    model_name="all-MiniLM-L6-v2", 
+    model_kwargs={"device": "cpu"}  # change to "cuda" if you have GPU
+)
+
+# Chunking
+TEXT_SPLITTER = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=300)
+
+# ================= Helper Functions =================
+def parse_metadata_from_filename(filename: str) -> Tuple[str, str]:
+    """Extract company name and year from filename."""
+    name_part = filename[:-4] if filename.lower().endswith(".pdf") else filename
+    parts = name_part.split("_")
+    if len(parts) >= 2:
+        company_name = "_".join(parts[:-1])
+        year_range = parts[-1]
+    else:
+        company_name = name_part
+        year_range = ""
+    return company_name, year_range
+
+
+def relative_output_dir(pdf_path: Path, root: Path) -> Path:
+    """Mirror the source tree under OUTPUT_BASE for FAISS index."""
+    rel_parent = pdf_path.parent.relative_to(root) if pdf_path.parent != root else Path()
+    return Path(OUTPUT_BASE) / rel_parent / pdf_path.stem
+
+
+def chunk_pdf(pdf_path: Path) -> List:
+    """Load PDF and split into chunks. Skips scanned/no-text PDFs."""
+    loader = PyPDFLoader(str(pdf_path))
+    pages = loader.load_and_split()
+    if not pages or all(not (d.page_content or "").strip() for d in pages):
+        print(f"⚠️  No extractable text in: {pdf_path} (likely scanned). Skipping.")
+        return []
+    chunks = TEXT_SPLITTER.split_documents(pages)
+    if not chunks:
+        print(f"⚠️  No chunks produced for: {pdf_path}. Skipping.")
+    return chunks
+
+
+def add_metadata(chunks: List, pdf_path: Path, root: Path):
+    """Add useful metadata to each chunk."""
+    company_name, year_range = parse_metadata_from_filename(pdf_path.name)
+    rel_path = pdf_path.relative_to(root)
+    for doc in chunks:
+        doc.metadata["pdf_name"] = pdf_path.name
+        doc.metadata["company_name"] = company_name
+        doc.metadata["year"] = year_range
+        doc.metadata["source_path"] = str(pdf_path)
+        doc.metadata["relative_path"] = str(rel_path).replace("\\", "/")
+        parts = list(rel_path.parts)
+        for i, part in enumerate(parts[:-1], start=1):
+            doc.metadata[f"folder_level_{i}"] = part
+
+
+def index_single_pdf(pdf_path: Path, root: Path):
+    """Index one PDF into a FAISS store saved under OUTPUT_BASE mirroring the tree."""
+    try:
+        chunks = chunk_pdf(pdf_path)
+        if not chunks:
+            return
+        add_metadata(chunks, pdf_path, root)
+        faiss_index = FAISS.from_documents(chunks, EMBEDDING_MODEL)
+        save_dir = relative_output_dir(pdf_path, root)
+        os.makedirs(save_dir, exist_ok=True)
+        faiss_index.save_local(str(save_dir))
+    except Exception as e:
+        print(f"❌ Error processing {pdf_path}: {e}")
+
+
+# ================= Main =================
+def main():
+    root = Path(MAIN_FOLDER)
+    if not root.exists() or not root.is_dir():
+        print(f"Folder not found: {root}")
+        return
+
+    pdf_files = list(root.rglob("*.pdf"))
+    if not pdf_files:
+        print("No PDFs found. Check your MAIN_FOLDER path.")
+        return
+
+    print(f"Found {len(pdf_files)} PDFs under: {root}\n")
+    for pdf_path in tqdm(pdf_files, desc="Processing PDFs", unit="file"):
+        index_single_pdf(pdf_path, root)
+
+
+if __name__ == "__main__":
+    main()
+
+
+import os
+import re
+import random
+import pandas as pd
+from pathlib import Path
+
+# LangChain / OpenAI
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+try:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+except Exception:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+
+
+# =====================
+# USER SETTINGS (paths as variables)
+# =====================
+PDF_FOLDER = r"C:\Users\SachinVishwakarma\Downloads\OneDrive_1_13-8-2025\NSE_Reports_30-07-25\Sheet1\pt1\NOCIL_Limited"   # <-- folder with PDFs
+VECTOR_STORE_BASE = r"C:\Users\AMEY MESTRY\Downloads\pt1\pt1\vector_shemaroo_financial_faiss_index_cognaize_financial_embedding"                     # <-- your prebuilt FAISS root
+SAMPLE_LIMIT = 0  # 0 = process all PDFs, or set to N to sample randomly      # 0 = process all PDFs, or set to N to sample randomly
+USE_PREBUILT = True       # try loading from VECTOR_STORE_BASE first
+# =====================
+# CONFIG
+# =====================
+# Use environment variable for safety; don't hardcode secrets.
+openai_api_key = '------'
+if not openai_api_key:
+    raise ValueError("OPENAI_API_KEY not set in environment.")
+
+embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0, api_key=openai_api_key)
+
+# =====================
+# QUESTIONS
+# =====================
+question_dict = {
+    "chartered_accountant_name_q1": (
+   
+    "Use signature-block cues. Often the block appears like:\n\n"
+    "For <Firm Name>\n"
+    "Chartered Accountants\n"
+    "Firm Reg. No. <FRN>\n"
+    "<Person Name>\n"
+    "Partner / Proprietor\n"
+    "Membership No. <...>\n"
+    "UDIN <...>\n\n"
+    "In such cases, the CA firm name is the line right after 'For' and ABOVE the line 'Chartered Accountants'. "
+    "Return ONLY the firm name(s) (e.g., 'Mehul Gada & Associates'). "
+    "Do NOT include partner/proprietor names, FRN, membership numbers, UDIN, place or date. "
+    "If multiple firms are appointed, list all, comma-separated. "
+    "Focus on the latest/current statutory auditor(s) if more than one period is shown."
+
+    ),
+    "ceo_name_q1": (
+        "Full name of the Chief Executive Officer (CEO). "
+        "Provide the name of the current CEO or Managing Director from the report. "
+        "Who is the Chief Executive Officer or top executive mentioned in the annual report? "
+        "Extract the exact name of the CEO or MD as stated in the Board of Directors section."
+    ),
+    "cfo_name_q1": (
+        "Full name of the Chief Financial Officer (CFO). "
+        "Name of the current CFO as per the financial statements or annual report. "
+        "Extract the name of the Chief Financial Officer or Finance Head mentioned in the annual report. "
+        "Who is responsible for the company's finance function as per the report?"
+    ),
+    "cto_name_q1": (
+        "Full name of the Chief Technology Officer (CTO). "
+        "If there is no CTO, give the most senior person responsible for technology, such as the Chief Information Officer (CIO), "
+        "Head of Technology, VP Engineering, Chief Digital Officer (CDO), or equivalent. "
+        "Who is the CTO or equivalent senior technology leader mentioned in the annual report? "
+        "Provide the name of the person heading technology, IT, or digital initiatives in the company. "
+        "Extract the name of the Chief Technology Officer, Chief Information Officer, or any top IT executive. "
+        "The CTO (or similar) will usually appear in:\n"
+        "- Corporate Information page (listing directors & key management personnel)\n"
+        "- Management Team or Leadership Team section\n"
+        "- Corporate Governance Report\n"
+        "- Board of Directors’ Report or Annual Return (MGT-9) attachments\n"
+        "Note: The CTO is not a signatory to the auditor’s report, so searching for a “technology person” in the same way as a partner will almost always fail. "
+        "Search in management or governance sections instead."
+    ),
+    "audit_term_length_q1": (
+        "From the annual report text, extract the exact number of years the statutory auditor "
+        "has been appointed for, as stated in the AGM notice, directors’ report, or corporate governance section.\n\n"
+        "Example 1:\n"
+        "Context: M/s XYZ & Co. were appointed as Statutory Auditors of the Company to hold office for a term of 5 years "
+        "from the conclusion of the 36th AGM until the conclusion of the 41st AGM.\n"
+        "Answer: 5\n\n"
+        "Example 2:\n"
+        "Context: M/s ABC LLP were appointed for a term of 3 years from FY 2022-23 to FY 2024-25.\n"
+        "Answer: 3\n\n"
+        "If the number of years is not mentioned, answer 'Not mentioned'. "
+        "State the duration in years for which the statutory auditor is appointed, based on the AGM notice. "
+        "How many years is the current statutory auditor’s appointment term as per the report? "
+        "Extract the tenure period in years for the statutory auditor from the corporate governance or directors’ report."
+    ),
+    "name_of_partner_q1": (
+    "Extract the exact name(s) of the individual(s) who SIGNED the audit report as Partner or Proprietor. "
+    "Treat 'Partner', 'PARTNER', and 'Proprietor' as equivalent role indicators. "
+    "Use signature-block cues. Example format:\n\n"
+    "For Mehul Gada & Associates\n"
+    "Chartered Accountants\n"
+    "Firm Reg. No. 156057W\n"
+    "Mehul Gada\n"
+    "partner\n"
+    "Membership No. 159997\n"
+    "UDIN 25159997BMNASR2467\n\n"
+    "From this, the partner/proprietor name is 'Mehul Gada'. "
+    "Pick the human name that appears adjacent to the role label (Partner/Proprietor) within the signature block, "
+    "even if the role label is above or below the name line. "
+    "Return ONLY the partner/proprietor name(s), comma-separated. "
+    "Do NOT include firm names, role labels, FRN, membership numbers, UDIN, place or date."),
+    # --- Added as requested (no extra regex) ---
+    "Related_Parties": "Give me the list of Related Parties.",
+}
+
+# =====================
+# PROMPT (kept intact)
+# =====================
+prompt_template = """
+You are an expert in reading Indian Annual Reports annual reports,
+financial statements, and governance documents.
+
+Instructions:
+1. Extract the exact names or numbers exactly as they appear in the document (do not rephrase).
+2. If multiple names or values are found:
+   - For auditor firms, partners, or executives → list all, separated by commas.
+   - For tenure/years → select the numeric value representing the term.
+   - For CEO/CFO/CTO → select the latest/current name if multiple are listed.
+3. For technology leadership roles:
+   - If there is no "Chief Technology Officer (CTO)", give the most senior person responsible for technology
+     (e.g., CIO, Head of Technology, VP Engineering, Chief Digital Officer, or equivalent).
+4. Ignore extra details such as , UDIN, place, or date unless the question explicitly asks for them.
+5. Answer strictly in the requested format, no extra words.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer with only:
+Names/Years: <comma-separated values>
+"""
+PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+
+# =====================
+# SIMPLE PREBUILT-INDEX LOADER
+# =====================
+def find_prebuilt_index_dir(pdf_path: str, index_base: str) -> str | None:
+    """
+    Look inside VECTOR_STORE_BASE for a directory named <pdf_stem> that has
+    index.faiss and index.pkl. Returns the directory path if found.
+    Picks the first match if multiple exist.
+    """
+    try:
+        stem = Path(pdf_path).stem
+        for root, dirs, _ in os.walk(index_base):
+            for d in dirs:
+                if d == stem:
+                    cand = os.path.join(root, d)
+                    if os.path.exists(os.path.join(cand, "index.faiss")) and os.path.exists(os.path.join(cand, "index.pkl")):
+                        return cand
+    except Exception:
+        pass
+    return None
+
+# =====================
+# HELPERS
+# =====================
+def build_or_load_faiss(pdf_path: str, index_path: str):
+    """
+    Prefer a prebuilt index from VECTOR_STORE_BASE.
+    Else try a local per-PDF index in _faiss_indexes.
+    Else build locally from the PDF.
+    Returns a FAISS db or None; caller will skip on None.
+    """
+    # 1) Try prebuilt
+    if USE_PREBUILT and VECTOR_STORE_BASE and os.path.isdir(VECTOR_STORE_BASE):
+        prebuilt = find_prebuilt_index_dir(pdf_path, VECTOR_STORE_BASE)
+        if prebuilt:
+            try:
+                return FAISS.load_local(prebuilt, embedding_model, allow_dangerous_deserialization=True)
+            except Exception:
+                # fall through to next options
+                pass
+
+    # 2) Try local per-PDF index
+    if os.path.exists(index_path):
+        try:
+            return FAISS.load_local(index_path, embedding_model, allow_dangerous_deserialization=True)
+        except Exception:
+            # try rebuilding below
+            pass
+
+    # 3) Build locally if nothing found
+    try:
+        loader = PyPDFLoader(pdf_path)
+        docs = loader.load()
+        # Drop empty pages
+        docs = [d for d in docs if (d.page_content or "").strip()]
+        if not docs:
+            print(f"   ↳ Skipping (no extractable text): {os.path.basename(pdf_path)}")
+            return None
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        docs = splitter.split_documents(docs)
+        docs = [d for d in docs if (d.page_content or "").strip()]
+        if not docs:
+            print(f"   ↳ Skipping (no chunks after split): {os.path.basename(pdf_path)}")
+            return None
+
+        db = FAISS.from_documents(docs, embedding_model)
+        os.makedirs(index_path, exist_ok=True)
+        db.save_local(index_path)
+        return db
+    except Exception as e:
+        # Handles FAISS IndexFlatL2 empty embeddings and any other failures
+        print(f"   ↳ Skipping due to error while indexing {os.path.basename(pdf_path)}: {e}")
+        return None
+
+def ask_questions_from_pdf(pdf_path: str, index_root: str):
+    pdf_name = os.path.basename(pdf_path)
+    index_folder_name = os.path.splitext(pdf_name)[0] + "_index"
+    index_path = os.path.join(index_root, index_folder_name)
+
+    db = build_or_load_faiss(pdf_path, index_path)
+    if db is None:
+        # Skip this PDF entirely if we couldn't build/load an index
+        return None
+
+    def custom_retriever(query):
+        keywords = [
+            "appointed for a period", "term of", "appointed for", "for X years",
+            "for a term of", "appointed as statutory auditors for", "until the conclusion of"
+        ]
+        boosted_query = query + " " + " ".join(keywords)
+        return db.as_retriever(search_kwargs={"k": 10}).get_relevant_documents(boosted_query)
+
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=db.as_retriever(search_kwargs={"k": 10}),
+        chain_type="stuff",
+        chain_type_kwargs={"prompt": PROMPT},
+        return_source_documents=False
+    )
+
+    row_data = {"PDF_Name": pdf_name}
+    print(f"\n📄 Processing: {pdf_name}")
+
+    for key, question in question_dict.items():
+        try:
+            if key == "audit_term_length_q1":
+                context_docs = custom_retriever(question)
+                context_text = "\n".join(doc.page_content for doc in context_docs)
+                answer_text = llm.predict(PROMPT.format(context=context_text, question=question)).strip()
+                match = re.search(r"\b(\d{1,2})\b", answer_text)
+                if match:
+                    names_or_years = match.group(1)
+                else:
+                    years = re.findall(r"(20\d{2})", context_text)
+                    if len(years) >= 2:
+                        names_or_years = str(int(years[-1]) - int(years[0]))
+                    else:
+                        names_or_years = "Not mentioned"
+            else:
+                answer_text = qa_chain.run(question).strip()
+                names_or_years = ""
+                for line in answer_text.split("\n"):
+                    if line.lower().startswith("names") or line.lower().startswith("years"):
+                        names_or_years = line.split(":", 1)[1].strip() if ":" in line else line.strip()
+                        break
+
+                if key == "cto_name_q1" and (not names_or_years or names_or_years.lower() == "[no names found]"):
+                    fallback_question = (
+                        "If there is no Chief Technology Officer, give the most senior person responsible "
+                        "for technology such as CIO, Head of Technology, VP Engineering, Chief Digital Officer, "
+                        "or equivalent. Provide exact name."
+                    )
+                    fallback_answer = qa_chain.run(fallback_question).strip()
+                    for line in fallback_answer.split("\n"):
+                        if line.lower().startswith("names:"):
+                            names_or_years = line[len("Names:"):].strip()
+                            break
+
+            if key == "chartered_accountant_name_q1" and names_or_years:
+                auditors = [n.strip() for n in names_or_years.split(",") if n.strip()]
+                year_map = {}
+                for auditor in auditors:
+                    year_match = re.search(r"(20\d{2})", auditor)
+                    if year_match:
+                        year_map[auditor] = int(year_match.group(1))
+                if year_map:
+                    names_or_years = max(year_map, key=year_map.get)
+                else:
+                    names_or_years = auditors[0] if auditors else names_or_years
+
+            row_data[key] = names_or_years if names_or_years else "[No names found]"
+            print(f"  {key}: {row_data[key]}")
+        except Exception as e:
+            # Per your request: skip errors at question level but keep other fields
+            row_data[key] = f"[Error: {e}]"
+            print(f"  {key}: ERROR -> {e}")
+
+    return row_data
+
+def run_for_folder(pdf_folder: str, sample_limit: int = 0):
+    """Process every PDF in pdf_folder; save results to that same folder."""
+    if not os.path.isdir(pdf_folder):
+        raise NotADirectoryError(f"Folder not found: {pdf_folder}")
+
+    index_root = os.path.join(pdf_folder, "_faiss_indexes")
+    os.makedirs(index_root, exist_ok=True)
+
+    output_excel = os.path.join(pdf_folder, "output_results.xlsx")
+    output_csv = os.path.join(pdf_folder, "output_results.csv")
+
+    all_pdfs = [os.path.join(pdf_folder, f) for f in os.listdir(pdf_folder) if f.lower().endswith(".pdf")]
+    if not all_pdfs:
+        print(f"❌ No PDFs found in {pdf_folder}")
+        return
+
+    selected_pdfs = (random.sample(all_pdfs, min(sample_limit, len(all_pdfs))) if sample_limit and sample_limit > 0
+                     else sorted(all_pdfs))
+
+    all_rows = []
+    for pdf_path in selected_pdfs:
+        try:
+            row = ask_questions_from_pdf(pdf_path, index_root)
+            if row:
+                all_rows.append(row)
+            else:
+                # Skipped due to indexing/no text/etc.
+                print(f"⏭️  Skipped: {os.path.basename(pdf_path)}")
+        except Exception as e:
+            # Per your request: skip the whole PDF on any unhandled error
+            print(f"⏭️  Skipped (error): {os.path.basename(pdf_path)} -> {e}")
+            continue
+
+    if not all_rows:
+        print("⚠️  No results to save.")
+        return
+
+    df = pd.DataFrame(all_rows)
+    df.to_excel(output_excel, index=False)
+    df.to_csv(output_csv, index=False)
+    print(f"\n✅ Results saved to:\n  Excel: {output_excel}\n  CSV:   {output_csv}")
+
+# =====================
+# RUN (path from variables)
+# =====================
+run_for_folder(PDF_FOLDER, sample_limit=SAMPLE_LIMIT)
