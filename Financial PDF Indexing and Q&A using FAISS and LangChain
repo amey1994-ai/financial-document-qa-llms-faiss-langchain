@@ -9,9 +9,9 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # ================= Settings =================
-MAIN_FOLDER =  r"C:\Users\AmeyMestry\Downloads\NSE_Reports\NSE_Reports_30-07-25\Sheet3\pt1\Shemaroo_Entertainment_Limited"
+MAIN_FOLDER =  r"main"
 
-OUTPUT_BASE = "C:\Users\AMEY MESTRY\Downloads\pt1\pt1\vector_shemaroo_financial_faiss_index_cognaize_financial_embedding"  
+OUTPUT_BASE = "output"  
 os.makedirs(OUTPUT_BASE, exist_ok=True)
 
 # Embeddings (downloaded from Hugging Face)
@@ -130,8 +130,8 @@ from langchain_openai import ChatOpenAI
 # =====================
 # USER SETTINGS (paths as variables)
 # =====================
-PDF_FOLDER = r"C:\Users\SachinVishwakarma\Downloads\OneDrive_1_13-8-2025\NSE_Reports_30-07-25\Sheet1\pt1\NOCIL_Limited"   # <-- folder with PDFs
-VECTOR_STORE_BASE = r"C:\Users\AMEY MESTRY\Downloads\pt1\pt1\vector_shemaroo_financial_faiss_index_cognaize_financial_embedding"                     # <-- your prebuilt FAISS root
+PDF_FOLDER = r"pdf"   # <-- folder with PDFs
+VECTOR_STORE_BASE = r"vector_db"                     # <-- your prebuilt FAISS root
 SAMPLE_LIMIT = 0  # 0 = process all PDFs, or set to N to sample randomly      # 0 = process all PDFs, or set to N to sample randomly
 USE_PREBUILT = True       # try loading from VECTOR_STORE_BASE first
 # =====================
